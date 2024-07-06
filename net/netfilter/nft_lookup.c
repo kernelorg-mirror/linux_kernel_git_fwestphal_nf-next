@@ -251,11 +251,13 @@ static int nft_lookup_validate(const struct nft_ctx *ctx,
 		.type		= NFT_ITER_UPDATE,
 		.fn		= nft_setelem_validate,
 	};
+	struct nft_ctx *pctx = (struct nft_ctx *)ctx;
 
 	if (!(priv->set->flags & NFT_SET_MAP) ||
 	    priv->set->dtype != NFT_DATA_VERDICT)
 		return 0;
 
+	pctx->level++;
 	priv->set->ops->walk(ctx, priv->set, &iter);
 	if (!iter.err)
 		iter.err = nft_set_catchall_validate(ctx, priv->set);
@@ -263,6 +265,7 @@ static int nft_lookup_validate(const struct nft_ctx *ctx,
 	if (iter.err < 0)
 		return iter.err;
 
+	pctx->level--;
 	return 0;
 }
 

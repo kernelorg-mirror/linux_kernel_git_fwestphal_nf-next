@@ -4213,7 +4213,6 @@ int nft_setelem_validate(const struct nft_ctx *ctx, struct nft_set *set,
 			 struct nft_elem_priv *elem_priv)
 {
 	const struct nft_set_ext *ext = nft_set_elem_ext(set, elem_priv);
-	struct nft_ctx *pctx = (struct nft_ctx *)ctx;
 	const struct nft_data *data;
 	int err;
 
@@ -4228,11 +4227,9 @@ int nft_setelem_validate(const struct nft_ctx *ctx, struct nft_set *set,
 	switch (data->verdict.code) {
 	case NFT_JUMP:
 	case NFT_GOTO:
-		pctx->level++;
 		err = nft_chain_validate(ctx, data->verdict.chain);
 		if (err < 0)
 			return err;
-		pctx->level--;
 		break;
 	default:
 		break;
