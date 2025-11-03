@@ -260,11 +260,16 @@ static int nft_immediate_validate(const struct nft_ctx *ctx,
 	case NFT_JUMP:
 	case NFT_GOTO:
 		pctx->level++;
-		err = nft_chain_validate(ctx, data->verdict.chain);
+		err = nft_chain_validate(pctx, data->verdict.chain);
 		if (err < 0)
 			return err;
+
 		pctx->level--;
-		break;
+
+		if (err == INT_MAX)
+			return -EMLINK;
+
+		return err + 1;
 	default:
 		break;
 	}

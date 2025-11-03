@@ -335,6 +335,9 @@ struct nft_set_iter {
 			      struct nft_set *set,
 			      const struct nft_set_iter *iter,
 			      struct nft_elem_priv *elem_priv);
+	union {
+		int jump_count;
+	} fn_state;
 };
 
 /**
@@ -1104,11 +1107,13 @@ enum nft_chain_types {
  *	@basetype_mask: chain receives packets from basetypes
  *	@hook_mask: chain receives packets from hook numbers
  *	@depth: chain was validated for call level <= depth
+ *	@jump_count: jump/goto count including those of reacheable subchains
  */
 struct nft_chain_validate_state {
 	u8			basetype_mask;
 	u8			hook_mask[NFT_CHAIN_T_MAX];
 	u8			depth;
+	int			jump_count;
 };
 
 /**
@@ -1293,6 +1298,7 @@ static inline void nft_use_inc_restore(u32 *use)
  *	@family:address family
  *	@flags: table flag (see enum nft_table_flags)
  *	@genmask: generation mask
+ * 	@jump_count: current [0] and next [1] jump to chain counter
  *	@nlpid: netlink port ID
  *	@name: name of the table
  *	@udlen: length of the user data
@@ -1317,6 +1323,9 @@ struct nft_table {
 	u16				udlen;
 	u8				*udata;
 	u8				validate_state;
+	struct {
+		int			jumps;
+	} count[2];
 };
 
 static inline bool nft_table_has_owner(const struct nft_table *table)
@@ -1916,6 +1925,9 @@ __printf(2, 3) int nft_request_module(struct net *net, const char *fmt, ...);
 #else
 static inline int nft_request_module(struct net *net, const char *fmt, ...) { return -ENOENT; }
 #endif
+
+int netfilter_nf_tables_sysctl_init(void);
+void netfilter_nf_tables_sysctl_fini(void);
 
 struct nftables_pernet {
 	struct list_head	tables;

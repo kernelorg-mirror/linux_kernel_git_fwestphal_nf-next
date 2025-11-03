@@ -266,7 +266,11 @@ static int nft_lookup_validate(const struct nft_ctx *ctx,
 		return iter.err;
 
 	pctx->level--;
-	return 0;
+
+	/* Only one vmap element can be matched at run time, assume it
+	 * is the one with the highest jump count.
+	 */
+	return max(iter.err, iter.fn_state.jump_count);
 }
 
 static bool nft_lookup_reduce(struct nft_regs_track *track,

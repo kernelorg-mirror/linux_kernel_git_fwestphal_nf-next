@@ -112,7 +112,6 @@ static void nft_validate_state_update(struct nft_table *table, u8 new_validate_s
 {
 	switch (table->validate_state) {
 	case NFT_VALIDATE_SKIP:
-		WARN_ON_ONCE(new_validate_state == NFT_VALIDATE_DO);
 		break;
 	case NFT_VALIDATE_NEED:
 		break;
@@ -1654,6 +1653,8 @@ static int nf_tables_newtable(struct sk_buff *skb, const struct nfnl_info *info,
 	table->handle = ++nft_net->table_handle;
 	if (table->flags & NFT_TABLE_F_OWNER)
 		table->nlpid = NETLINK_CB(skb).portid;
+
+	table->count[1].jumps = -1;
 
 	nft_ctx_init(&ctx, net, skb, info->nlh, family, table, NULL, nla);
 	err = nft_trans_table_add(&ctx, NFT_MSG_NEWTABLE);
@@ -4103,7 +4104,7 @@ static void nf_tables_rule_release(const struct nft_ctx *ctx, struct nft_rule *r
 	nf_tables_rule_destroy(ctx, rule);
 }
 
-static void nft_chain_vstate_update(const struct nft_ctx *ctx, struct nft_chain *chain)
+static void nft_chain_vstate_update(const struct nft_ctx *ctx, struct nft_chain *chain, int jump_count)
 {
 	const struct nft_base_chain *base_chain;
 	enum nft_chain_types type;
@@ -4125,6 +4126,8 @@ static void nft_chain_vstate_update(const struct nft_ctx *ctx, struct nft_chain 
 	chain->vstate.hook_mask[type] |= BIT(hooknum);
 	if (chain->vstate.depth < ctx->level)
 		chain->vstate.depth = ctx->level;
+
+	chain->vstate.jump_count = jump_count;
 }
 
 /** nft_chain_validate - loop detection and hook validation
@@ -4135,11 +4138,14 @@ static void nft_chain_vstate_update(const struct nft_ctx *ctx, struct nft_chain 
  * Walk through the rules of the given chain and chase all jumps/gotos
  * and set lookups until either the jump limit is hit or all reachable
  * chains have been validated.
+ *
+ * Return: number of jumps in the graph, -errno on failure.
  */
 int nft_chain_validate(const struct nft_ctx *ctx, struct nft_chain *chain)
 {
 	struct nft_expr *expr, *last;
 	struct nft_rule *rule;
+	int jump_count = 0;
 	int err;
 
 	BUILD_BUG_ON(NFT_JUMP_STACK_SIZE > 255);
@@ -4152,7 +4158,7 @@ int nft_chain_validate(const struct nft_ctx *ctx, struct nft_chain *chain)
 			return -ELOOP;
 
 		if (nft_chain_vstate_valid(ctx, chain))
-			return 0;
+			return chain->vstate.jump_count;
 	}
 
 	list_for_each_entry(rule, &chain->rules, list) {
@@ -4172,21 +4178,25 @@ int nft_chain_validate(const struct nft_ctx *ctx, struct nft_chain *chain)
 			err = expr->ops->validate(ctx, expr);
 			if (err < 0)
 				return err;
+
+			if (check_add_overflow(jump_count, err, &jump_count))
+				return -EMLINK;
 		}
 	}
 
-	nft_chain_vstate_update(ctx, chain);
-	return 0;
+	nft_chain_vstate_update(ctx, chain, jump_count);
+	return jump_count;
 }
 EXPORT_SYMBOL_GPL(nft_chain_validate);
 
-static int nft_table_validate(struct net *net, const struct nft_table *table)
+static int nft_table_validate(struct net *net, struct nft_table *table)
 {
 	struct nft_chain *chain;
 	struct nft_ctx ctx = {
 		.net	= net,
 		.family	= table->family,
 	};
+	int jump_count = 0;
 	int err = 0;
 
 	list_for_each_entry(chain, &table->chains, list) {
@@ -4199,6 +4209,11 @@ static int nft_table_validate(struct net *net, const struct nft_table *table)
 			goto err;
 
 		cond_resched();
+
+		if (check_add_overflow(jump_count, err, &jump_count))
+			return -EMLINK;
+
+		table->count[1].jumps = jump_count;
 	}
 
 err:
@@ -4213,6 +4228,7 @@ int nft_setelem_validate(const struct nft_ctx *ctx, struct nft_set *set,
 			 struct nft_elem_priv *elem_priv)
 {
 	const struct nft_set_ext *ext = nft_set_elem_ext(set, elem_priv);
+	struct nft_set_iter *iter_state = (void *)iter;
 	const struct nft_data *data;
 	int err;
 
@@ -4227,9 +4243,17 @@ int nft_setelem_validate(const struct nft_ctx *ctx, struct nft_set *set,
 	switch (data->verdict.code) {
 	case NFT_JUMP:
 	case NFT_GOTO:
-		err = nft_chain_validate(ctx, data->verdict.chain);
+		err = nft_chain_validate((void *)ctx, data->verdict.chain);
 		if (err < 0)
 			return err;
+
+		if (err == INT_MAX)
+			return -EMLINK;
+
+		++err;
+		if (err > iter->fn_state.jump_count)
+			iter_state->fn_state.jump_count = err;
+
 		break;
 	default:
 		break;
@@ -4259,7 +4283,109 @@ int nft_set_catchall_validate(const struct nft_ctx *ctx, struct nft_set *set)
 			return ret;
 	}
 
-	return ret;
+	return dummy_iter.fn_state.jump_count;
+}
+
+struct nft_jump_count {
+	int	jumps;
+	int	jumps_ipv4;
+	int	jumps_ipv6;
+};
+
+static int nft_jump_count_update(const struct nft_table *table,
+				 struct nft_jump_count *count)
+{
+	int idx;
+
+	/* If table has been updated with new jumps in this batch, then
+	 * use future jump count. Otherwise, use current jump count.
+	 */
+	if (table->count[1].jumps < 0)
+		idx = 0;
+	else
+		idx = 1;
+
+	switch (table->family) {
+	case NFPROTO_IPV4:
+		if (check_add_overflow(count->jumps_ipv4,
+				       table->count[idx].jumps,
+				       &count->jumps_ipv4))
+			return -1;
+		break;
+	case NFPROTO_IPV6:
+		if (check_add_overflow(count->jumps_ipv6,
+				       table->count[idx].jumps,
+				       &count->jumps_ipv6))
+			return -1;
+		break;
+	default:
+		if (check_add_overflow(count->jumps, table->count[idx].jumps,
+				       &count->jumps))
+			return -1;
+		break;
+	}
+
+	return 0;
+}
+
+static int nft_jump_count(struct net *net, struct nft_jump_count *count)
+{
+	struct nftables_pernet *nft_net = nft_pernet(net);
+	struct nft_table *table;
+
+	list_for_each_entry(table, &nft_net->tables, list) {
+		if (!nft_is_active_next(net, table))
+			continue;
+
+		if (nft_jump_count_update(table, count) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int nft_jump_count_ipv4(struct net *net,
+			       const struct nft_jump_count *count)
+{
+	int jumps;
+
+	if (check_add_overflow(count->jumps, count->jumps_ipv4, &jumps))
+		return -1;
+
+	return jumps;
+}
+
+static int nft_jump_count_ipv6(struct net *net,
+			       const struct nft_jump_count *count)
+{
+	int jumps;
+
+	if (check_add_overflow(count->jumps, count->jumps_ipv6, &jumps))
+		return -1;
+
+	return jumps;
+}
+
+static int nft_jump_count_check(struct net *net)
+{
+	u32 count_ipv4 = 0, count_ipv6 = 0;
+	struct nft_jump_count count = {};
+
+	if (net_eq(net, &init_net))
+		return 0;
+
+	if (nft_jump_count(net, &count) < 0)
+		return -EMLINK;
+
+	count_ipv4 = nft_jump_count_ipv4(net, &count);
+	if (count_ipv4 > net->nf.nf_tables_jumps_max_netns)
+		return -EMLINK;
+
+	count_ipv6 = nft_jump_count_ipv6(net, &count);
+	if (count_ipv6 > net->nf.nf_tables_jumps_max_netns)
+		return -EMLINK;
+
+	return 0;
 }
 
 static struct nft_rule *nft_rule_lookup_byid(const struct net *net,
@@ -4481,8 +4607,17 @@ static int nf_tables_newrule(struct sk_buff *skb, const struct nfnl_info *info,
 	if (flow)
 		nft_trans_flow_rule(trans) = flow;
 
-	if (table->validate_state == NFT_VALIDATE_DO)
-		return nft_table_validate(net, table);
+	if (table->validate_state == NFT_VALIDATE_DO) {
+		err = nft_table_validate(net, table);
+		if (err < 0)
+			return err;
+
+		/* rule might jump to chain either via immediate or lookup,
+		 * check if jump to chain count goes over the limit.
+		 */
+		if (nft_jump_count_check(net) < 0)
+			return -EMLINK;
+	}
 
 	return 0;
 
@@ -10167,6 +10302,17 @@ static int nf_tables_validate(struct net *net)
 		}
 	}
 
+	if (nft_jump_count_check(net) < 0) {
+		list_for_each_entry(table, &nft_net->tables, list) {
+			if (table->count[1].jumps < 0)
+				continue;
+
+			nft_validate_state_update(table, NFT_VALIDATE_DO);
+		}
+
+		return -EAGAIN;
+	}
+
 	return 0;
 }
 
@@ -10927,6 +11073,30 @@ static void nft_gc_seq_end(struct nftables_pernet *nft_net, unsigned int gc_seq)
 	WRITE_ONCE(nft_net->gc_seq, ++gc_seq);
 }
 
+static void nft_jump_count_reset(struct net *net)
+{
+	struct nftables_pernet *nft_net = nft_pernet(net);
+	struct nft_table *table;
+
+	list_for_each_entry(table, &nft_net->tables, list)
+		table->count[1].jumps = -1;
+}
+
+static void nft_jump_count_commit(struct net *net)
+{
+	struct nftables_pernet *nft_net = nft_pernet(net);
+	struct nft_table *table;
+
+	list_for_each_entry(table, &nft_net->tables, list) {
+		/* no new jumps in this table, skip. */
+		if (table->count[1].jumps < 0)
+			continue;
+
+		table->count[0].jumps = table->count[1].jumps;
+		table->count[1].jumps = -1;
+	}
+}
+
 static int nf_tables_commit(struct net *net, struct sk_buff *skb)
 {
 	struct nftables_pernet *nft_net = nft_pernet(net);
@@ -10983,6 +11153,8 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
 	err = nft_flow_rule_offload_commit(net);
 	if (err < 0)
 		return err;
+
+	nft_jump_count_commit(net);
 
 	/* 1.  Allocate space for next generation rules_gen_X[] */
 	list_for_each_entry_safe(trans, next, &nft_net->commit_list, list) {
@@ -11323,6 +11495,8 @@ static int __nf_tables_abort(struct net *net, enum nfnl_abort_action action)
 	if (action == NFNL_ABORT_VALIDATE &&
 	    nf_tables_validate(net) < 0)
 		err = -EAGAIN;
+
+	nft_jump_count_reset(net);
 
 	list_for_each_entry_safe_reverse(trans, next, &nft_net->commit_list,
 					 list) {
