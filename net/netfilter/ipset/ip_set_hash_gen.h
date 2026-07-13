@@ -130,6 +130,7 @@ static const union nf_inet_addr zeromask = {};
 #undef mtype_kadt
 #undef mtype_uadt
 
+#undef mtype_remove_random
 #undef mtype_add
 #undef mtype_do_set_exts
 #undef mtype_del
@@ -181,6 +182,7 @@ static const union nf_inet_addr zeromask = {};
 #define mtype_kadt		IPSET_TOKEN(MTYPE, _kadt)
 #define mtype_uadt		IPSET_TOKEN(MTYPE, _uadt)
 
+#define mtype_remove_random	IPSET_TOKEN(MTYPE, _remove_random)
 #define mtype_add		IPSET_TOKEN(MTYPE, _add)
 #define mtype_set_exts		IPSET_TOKEN(MTYPE, _set_exts)
 #define mtype_del		IPSET_TOKEN(MTYPE, _del)
@@ -597,6 +599,33 @@ static void mtype_set_exts(struct ip_set *set, struct htype *h,
 		ip_set_timeout_set(ext_timeout(&e->elem, set), ext->timeout);
 }
 
+/* Evict one element from the set to make room for a new one (forceadd) */
+static void __maybe_unused
+mtype_remove_random(struct ip_set *set, struct htype *h)
+{
+	struct rhashtable_iter hti;
+	struct mtype_rht_elem *e;
+	bool removed = false;
+
+	ipset_hash_walk_enter(h, &hti);
+	rhashtable_walk_start(&hti);
+	e = rhashtable_walk_next(&hti);
+	if (IS_ERR(e))
+		e = NULL;
+
+	if (e && !ipset_hash_remove(h, e))
+		removed = true;
+
+	rhashtable_walk_stop(&hti);
+	rhashtable_walk_exit(&hti);
+
+	if (removed) {
+		mtype_del_cidr_all(set, h, &e->elem);
+		ip_set_ext_destroy(set, &e->elem);
+		kfree_rcu(e, rcu);
+	}
+}
+
 /* Add an element to a hash and update the internal counters when succeeded,
  * otherwise report the proper error code.
  */
@@ -690,11 +719,15 @@ insert:
 	}
 
 	if (ipset_hash_nelems(h) >= h->maxelem) {
-		if (net_ratelimit())
-			pr_warn("Set %s is full, maxelem %u reached\n",
-				set->name, h->maxelem);
-		ret = -IPSET_ERR_HASH_FULL;
-		goto out_rcu_unlock;
+		if (SET_WITH_FORCEADD(set)) {
+			mtype_remove_random(set, h);
+		} else {
+			if (net_ratelimit())
+				pr_warn("Set %s is full, maxelem %u reached\n",
+					set->name, h->maxelem);
+			ret = -IPSET_ERR_HASH_FULL;
+			goto out_rcu_unlock;
+		}
 	}
 
 	e = kzalloc(offsetof(struct mtype_rht_elem, elem) + set->dsize,
