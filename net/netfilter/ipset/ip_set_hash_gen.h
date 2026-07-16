@@ -137,7 +137,6 @@ static const union nf_inet_addr zeromask = {};
 #undef mtype_gc_do
 #undef mtype_gc
 #undef mtype_gc_init
-#undef mtype_cancel_gc
 #undef mtype_variant
 #undef mtype_data_match
 
@@ -188,7 +187,6 @@ static const union nf_inet_addr zeromask = {};
 #define mtype_gc_do		IPSET_TOKEN(MTYPE, _gc_do)
 #define mtype_gc		IPSET_TOKEN(MTYPE, _gc)
 #define mtype_gc_init		IPSET_TOKEN(MTYPE, _gc_init)
-#define mtype_cancel_gc		IPSET_TOKEN(MTYPE, _cancel_gc)
 #define mtype_variant		IPSET_TOKEN(MTYPE, _variant)
 #define mtype_data_match	IPSET_TOKEN(MTYPE, _data_match)
 
@@ -449,6 +447,9 @@ mtype_destroy(struct ip_set *set)
 	u32 i;
 #endif
 
+	if (SET_WITH_TIMEOUT(set))
+		disable_delayed_work_sync(&h->gc.dwork);
+
 #ifdef IP_SET_HASH_WITH_MULTI
 	rhltable_free_and_destroy(&h->rhlt, mtype_flush_elem, set);
 #else
@@ -548,15 +549,6 @@ mtype_gc_init(struct htable_gc *gc)
 {
 	INIT_DEFERRABLE_WORK(&gc->dwork, mtype_gc);
 	queue_delayed_work(system_power_efficient_wq, &gc->dwork, HZ);
-}
-
-static void
-mtype_cancel_gc(struct ip_set *set)
-{
-	struct htype *h = set->data;
-
-	if (SET_WITH_TIMEOUT(set))
-		disable_delayed_work_sync(&h->gc.dwork);
 }
 
 /* Get the current number of elements and per-element memory in the set */
@@ -1129,7 +1121,6 @@ static const struct ip_set_type_variant mtype_variant = {
 	.list	= mtype_list,
 	.uref	= mtype_uref,
 	.same_set = mtype_same_set,
-	.cancel_gc = mtype_cancel_gc,
 };
 
 #ifdef IP_SET_EMIT_CREATE

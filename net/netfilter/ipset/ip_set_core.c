@@ -1129,7 +1129,6 @@ static int ip_set_create(struct sk_buff *skb, const struct nfnl_info *info,
 	return ret;
 
 cleanup:
-	set->variant->cancel_gc(set);
 	ip_set_destroy_set(set);
 put_out:
 	module_put(set->type->me);
@@ -1172,27 +1171,21 @@ _destroy_all_sets(struct ip_set_net *inst)
 {
 	struct ip_set *set;
 	ip_set_id_t i;
-	bool need_wait = false;
 
-	/* First cancel gc's: set:list sets are flushed as well */
+	/* sets referencing other sets must go first */
 	for (i = 0; i < inst->ip_set_max; i++) {
 		set = ip_set(inst, i);
-		if (set) {
-			set->variant->cancel_gc(set);
-			if (set->type->features & IPSET_TYPE_NAME)
-				need_wait = true;
+		if (set && (set->type->features & IPSET_TYPE_NAME)) {
+			ip_set(inst, i) = NULL;
+			destroy_and_free_set(set);
 		}
 	}
-	/* Must wait for flush to be really finished  */
-	if (need_wait)
-		rcu_barrier();
+
 	for (i = 0; i < inst->ip_set_max; i++) {
 		set = ip_set(inst, i);
 		if (set) {
 			ip_set(inst, i) = NULL;
-			ip_set_destroy_set(set);
-			module_put(set->type->me);
-			kfree(set);
+			destroy_and_free_set(set);
 		}
 	}
 }
@@ -1234,7 +1227,6 @@ static int ip_set_destroy(struct sk_buff *skb, const struct nfnl_info *info,
 		inst->is_destroyed = false;
 	} else {
 		u32 flags = flag_exist(info->nlh);
-		u16 features = 0;
 
 		read_lock_bh(&ip_set_ref_lock);
 		s = find_set_and_id(inst, nla_data(attr[IPSET_ATTR_SETNAME]),
@@ -1247,15 +1239,9 @@ static int ip_set_destroy(struct sk_buff *skb, const struct nfnl_info *info,
 			ret = -IPSET_ERR_BUSY;
 			goto out;
 		}
-		features = s->type->features;
+
 		ip_set(inst, i) = NULL;
 		read_unlock_bh(&ip_set_ref_lock);
-		/* Must cancel garbage collectors */
-		s->variant->cancel_gc(s);
-		if (features & IPSET_TYPE_NAME) {
-			/* Must wait for flush to be really finished  */
-			rcu_barrier();
-		}
 		INIT_RCU_WORK(&s->rwork, ip_set_destroy_set_work);
 		queue_rcu_work(ipset_destroy_wq, &s->rwork);
 	}

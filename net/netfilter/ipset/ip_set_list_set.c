@@ -452,7 +452,16 @@ list_set_destroy(struct ip_set *set)
 {
 	struct list_set *map = set->data;
 
+	if (SET_WITH_TIMEOUT(set))
+		timer_shutdown_sync(&map->gc);
+
+	/* Flush list to drop references to other ipsets */
+	list_set_flush(set);
+
 	WARN_ON_ONCE(!list_empty(&map->members));
+
+	/* wait for call_rcu()s */
+	rcu_barrier();
 	kfree(map);
 
 	set->data = NULL;
@@ -563,18 +572,6 @@ list_set_same_set(const struct ip_set *a, const struct ip_set *b)
 	       a->extensions == b->extensions;
 }
 
-static void
-list_set_cancel_gc(struct ip_set *set)
-{
-	struct list_set *map = set->data;
-
-	if (SET_WITH_TIMEOUT(set))
-		timer_shutdown_sync(&map->gc);
-
-	/* Flush list to drop references to other ipsets */
-	list_set_flush(set);
-}
-
 static const struct ip_set_type_variant set_variant = {
 	.kadt	= list_set_kadt,
 	.uadt	= list_set_uadt,
@@ -588,7 +585,6 @@ static const struct ip_set_type_variant set_variant = {
 	.head	= list_set_head,
 	.list	= list_set_list,
 	.same_set = list_set_same_set,
-	.cancel_gc = list_set_cancel_gc,
 };
 
 static void

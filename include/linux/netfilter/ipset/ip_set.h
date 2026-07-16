@@ -184,8 +184,6 @@ struct ip_set_type_variant {
 	/* Return true if "b" set is the same as "a"
 	 * according to the create set parameters */
 	bool (*same_set)(const struct ip_set *a, const struct ip_set *b);
-	/* Cancel ongoing garbage collectors before destroying the set*/
-	void (*cancel_gc)(struct ip_set *set);
 };
 
 /* Max range where every element is added/deleted in one step */
